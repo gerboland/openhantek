@@ -44,6 +44,7 @@
 #include "dsowidget.h"
 #include "settings.h"
 #include "hantek/control.h"
+#include "hantek-6xxx/control.h"
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -62,7 +63,8 @@ OpenHantekMainWindow::OpenHantekMainWindow(QWidget *parent, Qt::WindowFlags flag
 	this->setWindowTitle(tr("OpenHantek"));
 	
 	// Create the controller for the oscilloscope, provides channel count for settings
-	this->dsoControl = new Hantek::Control();
+	//this->dsoControl = new Hantek::Control();
+	this->dsoControl = new Hantek6xxx::Control();
 	
 	// Application settings
 	this->settings = new DsoSettings();
