@@ -38,6 +38,8 @@
 #include "helper.h"
 
 #define HANTEK_CHANNELS		2
+#define HANTEX_6022BE_VENDOR	0x04b5
+#define HANTEX_6022BE_PRODUCT	0x6022
 
 #define SAMPLERATE_VALUES \
 	SR_MHZ(48), SR_MHZ(30), SR_MHZ(24), \
@@ -67,7 +69,7 @@
 #define HANTEK_EP_IN		0x86
 
 namespace Hantek6xxx {
-	enum control_requests {
+	enum controlRequests {
 		VDIV_CH1_REG   = 0xe0,
 		VDIV_CH2_REG   = 0xe1,
 		SAMPLERATE_REG = 0xe2,
@@ -105,7 +107,7 @@ namespace Hantek6xxx {
 
 		libusb_set_debug(this->usbContext, 3);
 
-		this->device = libusb_open_device_with_vid_pid(this->usbContext, 0x1D50, 0x608E);
+		this->device = libusb_open_device_with_vid_pid(this->usbContext, HANTEX_6022BE_VENDOR, HANTEX_6022BE_PRODUCT);
 		if (!this->device) {
 			QString message("Unable to open device");
 			qDebug() << message;
@@ -206,6 +208,11 @@ namespace Hantek6xxx {
 	/// \brief Handles all USB things until the device gets disconnected.
 	void Control::run() {
 		// Initialize communication thread state
+
+		// GERRY !!!! this needs to happen in the init of the thread
+		libusb_handle_events(this->usbContext);
+
+
 
 		// The control loop is running until the device is disconnected
 		exec();
@@ -395,8 +402,17 @@ namespace Hantek6xxx {
 		if(!this->device)
 			return 0.0;
 
-		// IMPLEMENT
-		return 1.0;
+		// TODO convert supplied sample rate to a supported value
+
+		uchar value = 0x01;
+		int ret = libusb_control_transfer(this->device, LIBUSB_REQUEST_TYPE_VENDOR, SAMPLERATE_REG, 0x00, 0x00, &value, 1, 100);
+		if (ret < 0) {
+			qDebug("setSamplerate failed with error: %s", libusb_error_name(ret));
+		} else {
+			qDebug("setSamplerate returned %d (number of bytes transferred successfully)", ret);
+		}
+
+		return samplerate;
 	}
 
 	/// \brief Sets the time duration of one aquisition by adapting the samplerate.

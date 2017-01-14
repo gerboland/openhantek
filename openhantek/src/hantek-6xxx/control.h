@@ -32,7 +32,9 @@
 
 #include "dsocontrol.h"
 
+extern "C" {
 #include <libusb-1.0/libusb.h>
+}
 
 namespace Hantek6xxx {
 	class Device;
@@ -86,8 +88,6 @@ namespace Hantek6xxx {
 			int stringCommand(QString command) override;
 	#endif
 		private:
-			bool connect();
-
 			libusb_context *usbContext;
 			libusb_device_handle *device;
 
