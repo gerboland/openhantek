@@ -63,13 +63,18 @@ namespace Hantek6xxx {
 				COUPLING_REG   = 0xe5,
 			};
 
-		protected:
-			void run() override;
+			// Lazy
+			bool channelsActive[2];
+			unsigned int channelsGain[2];
+			double channelsOffset[2];
+			double samplerate;
 
 			// Results
 			std::vector<std::vector<double> > samples; ///< Sample data vectors sent to the data analyzer
-			unsigned int previousSampleCount; ///< The expected total number of samples at the last check before sampling started
 			QMutex samplesMutex; ///< Mutex for the sample data
+
+	protected:
+		void run() override;
 
 		public slots:
 			void connectDevice() override;
@@ -102,8 +107,9 @@ namespace Hantek6xxx {
 			libusb_context *usbContext;
 			libusb_device_handle *device;
 
+			struct libusb_transfer *transfer;
+
 			QList<unsigned int> availableRecordLengths;
-			bool channelsActive[2];
 	};
 
 } // namespace Hantek6xxx

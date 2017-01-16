@@ -86,11 +86,10 @@ QMap<int, unsigned int> voltageRanges ( {
 	{1000000,	10}, // +/- 500mV
 });
 
-static unsigned long num_bytes = 0, num_xfer = 0;
-
 static void callbackUSBTransferComplete(struct libusb_transfer *xfr)
 {
 	int i;
+	auto thiz = static_cast<Hantek6xxx::Control*>(xfr->user_data);
 
 	if (xfr->status != LIBUSB_TRANSFER_COMPLETED) {
 		fprintf(stderr, "transfer status %d\n", xfr->status);
@@ -107,22 +106,45 @@ static void callbackUSBTransferComplete(struct libusb_transfer *xfr)
 //				return;
 //			}
 
-			printf("pack%u length:%u, actual_length:%u, status:%d\n", i, pack->length, pack->actual_length, pack->status);
+//			printf("pack%u length:%u, actual_length:%u, status:%d\n", i, pack->length, pack->actual_length, pack->status);
 		}
 	}
 
-	printf("length:%u, actual_length:%u\n", xfr->length, xfr->actual_length);
-	for (i = 0; i < xfr->length; i+=2) { // was actual_length
-		printf("%02x %02x \n", xfr->buffer[i] - 128, xfr->buffer[i+1] - 128	);
+//	printf("length:%u, actual_length:%u\n", xfr->length, xfr->actual_length);
+
+	thiz->samplesMutex.lock();
+
+	double scale = (5.0 * thiz->channelsOffset[1]) / (thiz->channelsGain[1] << 7);
+
+	if (thiz->channelsActive[1] && !thiz->channelsActive[2]) { // single channel mode
+		// Resize sample vector
+		thiz->samples[0].resize(xfr->length);
+		for (i = 0; i < xfr->length; i++) {
+			//printf("%04lf\n", (xfr->buffer[i] - 128) * scale);
+			thiz->samples[0][i] = (xfr->buffer[i] - 128) * scale;
+		}
+	} else { // dual channel mode
+		double scale2 = (5.0 * thiz->channelsOffset[2]) / (thiz->channelsGain[2] << 7);
+
+		// Resize sample vector
+		thiz->samples[0].resize(xfr->length / 2);
+		thiz->samples[1].resize(xfr->length / 2);
+
+		for (i = 0; i < xfr->length; i+=2) {
+			//printf("%04lf %04lf\n", (xfr->buffer[i] - 128) * scale, (xfr->buffer[i+1] - 128) * scale2);
+			thiz->samples[0][i/2] = (xfr->buffer[i] - 128) * scale;
+			thiz->samples[1][i/2+1] = (xfr->buffer[i+1] - 128) * scale2;
+		}
 	}
-	//printf("\n");
-	num_bytes += xfr->length; // was actual_length
-	num_xfer++;
+	thiz->samplesMutex.unlock();
 
 	if (libusb_submit_transfer(xfr) < 0) {
 		fprintf(stderr, "error re-submitting URB\n");
 		return;
 	}
+
+	emit thiz->samplesAvailable(&(thiz->samples), thiz->samplerate,
+								true, &(thiz->samplesMutex));
 }
 
 } // anonymous namespace
@@ -132,11 +154,15 @@ namespace Hantek6xxx {
 	/// \param parent The parent widget.
 	Control::Control(QObject *parent)
 		: DsoControl(parent)
+		, channelsActive{true, true}
+		, channelsGain{0x01, 0x01}
+		, channelsOffset{1.0, 1.0}
 		, usbContext(nullptr)
 		, device(nullptr)
-		, channelsActive{true, true}
+		, transfer(nullptr)
+		, samplerate(-1.0)
 	{
-		this->previousSampleCount = 0;
+		samples.resize(2);
 	}
 
 	/// \brief Disconnects the device.
@@ -231,37 +257,35 @@ namespace Hantek6xxx {
 		qDebug("Start Sampling");
 		controlWrite(TRIGGER_REG, 1);
 
-		struct libusb_transfer *xfr;
 		unsigned char *data;
 		const unsigned int size = 1024;
-		int num_iso_pack = 3; //libusb_get_max_iso_packet_size(this->device, 0x82);
+		int num_iso_pack = 1; //libusb_get_max_iso_packet_size(this->device, 0x82);
 
-		data = (unsigned char*) malloc(size * num_iso_pack);
-		for (int i=0; i<size * num_iso_pack; i++) data[i] = 0x0;
+		data = (unsigned char*) malloc(size * num_iso_pack); // leaky
 
-		xfr = libusb_alloc_transfer(num_iso_pack);
-		if(!xfr){
+		this->transfer = libusb_alloc_transfer(num_iso_pack);
+		if(!this->transfer){
 			QString message = QString("Unable to allocate transfer memory");
 			qDebug() << message;
 			emit statusMessage(message, 0);
 			return;
 		}
 
-		libusb_fill_iso_transfer(xfr,
+		libusb_fill_iso_transfer(this->transfer,
 								 this->device,
 								 0x82, // Endpoint ID
 								 data,
 								 size,
 								 num_iso_pack,
 								 callbackUSBTransferComplete,
-								 NULL,
+								 this,
 								 100);
-		libusb_set_iso_packet_lengths(xfr, size);
+		libusb_set_iso_packet_lengths(this->transfer, size);
 
-		if(libusb_submit_transfer(xfr) < 0)
-		{
+		if(libusb_submit_transfer(this->transfer) < 0) {
 			// Error
-			libusb_free_transfer(xfr);
+			libusb_free_transfer(this->transfer);
+			this->transfer = nullptr;
 			free(data);
 			qDebug("ERROR in submission");
 		}
@@ -277,6 +301,12 @@ namespace Hantek6xxx {
 		qDebug("Stop Sampling");
 		controlWrite(TRIGGER_REG, 0);
 
+		if(this->transfer)
+			libusb_cancel_transfer(this->transfer);
+
+//		Do this only when last transmission completed, else undefined behaviour
+//		libusb_free_transfer(this->transfer);
+//		this->transfer = nullptr;
 		DsoControl::stopSampling();
 	}
 
@@ -316,7 +346,7 @@ namespace Hantek6xxx {
 		}
 
 		// The control loop is running until the device is disconnected
-		//exec();
+//		exec();
 
 		emit statusMessage(tr("The device has been disconnected"), 0);
 	}
@@ -504,31 +534,42 @@ namespace Hantek6xxx {
 			return 0.0;
 
 		qDebug("setSamplerate(samplerate=%lf)", samplerate);
+		double newSamplerate = -1.0; // start invalid
+		unsigned char newSamplerateValue;
+
 		// If samplerate too low, round up to the first possible option
 		auto iter = ::sampleRates.constBegin();
 		if(iter.key() >= samplerate) {
-			controlWrite(SAMPLERATE_REG, iter.value());
-			return iter.value();
+			newSamplerate = iter.key();
+			newSamplerateValue = iter.value();
 		}
 
 		auto trailingIter = ::sampleRates.constBegin();
 		iter++;
 
-		// If in middle of the range of samples possible, round up to closest
-		while(iter != ::sampleRates.constEnd()) {
-			if(iter.key() <= samplerate && trailingIter.key() >= samplerate) {
-				controlWrite(SAMPLERATE_REG, iter.value()); // always round up
-				return iter.value();
+		if (newSamplerate < 0) {
+			// If in middle of the range of samples possible, round up to closest
+			while(iter != ::sampleRates.constEnd()) {
+				if(iter.key() <= samplerate && trailingIter.key() >= samplerate) {
+					newSamplerate = iter.key();
+					newSamplerateValue = iter.value();
+				}
+				iter++;
+				trailingIter++;
 			}
-			iter++;
-			trailingIter++;
 		}
 
-		// Else samplerate too high so round down to the highest possible option
-		auto value = trailingIter.value();
-		controlWrite(SAMPLERATE_REG, value);
-		emit samplerateChanged(value);
-		return value;
+		if (newSamplerate < 0) {
+			// Else samplerate too high so round down to the highest possible option
+			newSamplerate = trailingIter.key();
+			newSamplerateValue = trailingIter.value();
+		}
+
+		if (!qFuzzyCompare(this->samplerate, newSamplerate)) {
+			controlWrite(SAMPLERATE_REG, newSamplerateValue);
+			emit samplerateChanged(newSamplerate);
+		}
+		return newSamplerate;
 	}
 
 	/// \brief Sets the time duration of one aquisition by adapting the samplerate.
@@ -555,7 +596,9 @@ namespace Hantek6xxx {
 
 		// Only possible situations are Channel1&2, and Channel 1 alone;
 		if (channel == 2 && used && !channelsActive[1]) {
+			emit statusMessage("Channel options are either CH1 or CH1&CH2", 0);
 			return Dso::ERROR_UNSUPPORTED;
+		}
 
 		qDebug("setChannelUsed(channel=%d, used=%d)", channel, (int)used);
 
@@ -602,8 +645,10 @@ namespace Hantek6xxx {
 		// Apparently the chipset can deal any integer gain values
 		unsigned int value = (unsigned int) gain;
 
-		controlWrite(reg, value);
+		if(controlWrite(reg, value) <= 0)
+			return Dso::ERROR_UNSUPPORTED;
 
+		channelsGain[channel] = value;
 		return value;
 	}
 
@@ -618,8 +663,9 @@ namespace Hantek6xxx {
 		if(channel >= HANTEK_CHANNELS)
 			return Dso::ERROR_PARAMETER;
 
-		// IMPLEMENT
-		return 1.0;
+		channelsOffset[channel] = offset;
+		// what next?
+		return offset;
 	}
 
 	/// \brief Set the trigger mode.
