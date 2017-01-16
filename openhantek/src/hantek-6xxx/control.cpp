@@ -31,6 +31,7 @@
 
 #include <QList>
 #include <QMutex>
+#include <QTimer>
 #include <QDebug>
 
 #include "hantek-6xxx/control.h"
@@ -40,15 +41,6 @@
 #define HANTEK_CHANNELS		2
 #define HANTEX_6022BE_VENDOR	0x04b5
 #define HANTEX_6022BE_PRODUCT	0x6022
-
-#define SAMPLERATE_VALUES \
-	SR_MHZ(48), SR_MHZ(30), SR_MHZ(24), \
-	SR_MHZ(16), SR_MHZ(8), SR_MHZ(4), \
-	SR_MHZ(1), SR_KHZ(500), SR_KHZ(200), \
-	SR_KHZ(100),
-
-#define SAMPLERATE_REGS \
-	48, 30, 24, 16, 8, 4, 1, 50, 20, 10,
 
 #define VDIV_VALUES \
 	{ 100, 1000 }, \
@@ -68,32 +60,99 @@
 
 #define HANTEK_EP_IN		0x86
 
-namespace Hantek6xxx {
-	enum controlRequests {
-		VDIV_CH1_REG   = 0xe0,
-		VDIV_CH2_REG   = 0xe1,
-		SAMPLERATE_REG = 0xe2,
-		TRIGGER_REG    = 0xe3,
-		CHANNELS_REG   = 0xe4,
-		COUPLING_REG   = 0xe5,
-	};
+namespace {
 
+QMap<int, unsigned int> sampleRates ( {
+	//{Actual sample rate, Rate index}
+	{100000,	10}, // 100 KS/s
+	{200000,	20}, // 200 KS/s
+	{500000,	50}, // 500 KS/s
+	{1000000,	1}, // 1 MS/s
+	{2000000,	2}, // 2 MS/s
+	{4000000,	4}, // 4 MS/s
+	{8000000,	8}, // 8 MS/s
+	{12000000,	12}, // 12 MS/s
+	{16000000,	16}, // 16 MS/s
+	{24000000,	24}, // 24 MS/s
+	{30000000,	30}, // 30 MS/s
+	{48000000,	48}, // 48 MS/s
+});
+
+QMap<int, unsigned int> voltageRanges ( {
+	//{Actual sample rate, Rate index}
+	{100000,	1}, // +/- 5V
+	{200000,	2}, // +/- 2.5V
+	{500000,	5}, // +/- 1V
+	{1000000,	10}, // +/- 500mV
+});
+
+static unsigned long num_bytes = 0, num_xfer = 0;
+
+static void callbackUSBTransferComplete(struct libusb_transfer *xfr)
+{
+	int i;
+
+	if (xfr->status != LIBUSB_TRANSFER_COMPLETED) {
+		fprintf(stderr, "transfer status %d\n", xfr->status);
+		libusb_free_transfer(xfr);
+		return;
+	}
+
+	if (xfr->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
+		for (i = 0; i < xfr->num_iso_packets; i++) {
+			struct libusb_iso_packet_descriptor *pack = &xfr->iso_packet_desc[i];
+
+//			if (pack->status != LIBUSB_TRANSFER_COMPLETED) {
+//				fprintf(stderr, "Error: pack %u status %d\n", i, pack->status);
+//				return;
+//			}
+
+			printf("pack%u length:%u, actual_length:%u, status:%d\n", i, pack->length, pack->actual_length, pack->status);
+		}
+	}
+
+	printf("length:%u, actual_length:%u\n", xfr->length, xfr->actual_length);
+	for (i = 0; i < xfr->length; i+=2) { // was actual_length
+		printf("%02x %02x \n", xfr->buffer[i] - 128, xfr->buffer[i+1] - 128	);
+	}
+	//printf("\n");
+	num_bytes += xfr->length; // was actual_length
+	num_xfer++;
+
+	if (libusb_submit_transfer(xfr) < 0) {
+		fprintf(stderr, "error re-submitting URB\n");
+		return;
+	}
+}
+
+} // anonymous namespace
+
+namespace Hantek6xxx {
 	/// \brief Initializes the command buffers and lists.
 	/// \param parent The parent widget.
 	Control::Control(QObject *parent)
 		: DsoControl(parent)
-		, usbContext(NULL)
-		, device(NULL) {
+		, usbContext(nullptr)
+		, device(nullptr)
+		, channelsActive{true, true}
+	{
 		this->previousSampleCount = 0;
-
-//		connect(this->device, SIGNAL(disconnected()), this, SLOT(disconnectDevice()));
 	}
 
 	/// \brief Disconnects the device.
 	Control::~Control() {
-		libusb_release_interface(this->device, 0);
-		libusb_close(this->device);
+		stopSampling();
+
+		if (this->device) {
+			libusb_release_interface(this->device, 0);
+			this->device = nullptr;
+
+			libusb_close(this->device);
+		}
 		libusb_exit(this->usbContext);
+		this->usbContext = nullptr;
+
+		emit deviceDisconnected();
 	}
 
 	/// \brief Try to connect to the oscilloscope.
@@ -115,7 +174,7 @@ namespace Hantek6xxx {
 			return;
 		}
 
-		if (libusb_kernel_driver_active(this->device, 0) == 1) {
+		if ((ret = libusb_kernel_driver_active(this->device, 0)) == 1) {
 			if (libusb_detach_kernel_driver(this->device, 0) != 0) {
 				libusb_close(this->device);
 				this->device = nullptr;
@@ -127,11 +186,21 @@ namespace Hantek6xxx {
 			}
 		}
 
-		if (libusb_claim_interface(this->device, 0) < 0) {
+		if ((ret = libusb_claim_interface(this->device, 0)) < 0) {
 			libusb_close(this->device);
 			this->device = nullptr;
 
 			QString message = QString("Unable to claim interface: %1").arg(libusb_error_name(ret));
+			qDebug() << message;
+			emit statusMessage(message, 0);
+			return;
+		}
+		libusb_set_interface_alt_setting(this->device, 0, 0);
+		if ((ret = libusb_set_interface_alt_setting(this->device, 0, 1)) < 0) {
+			libusb_close(this->device);
+			this->device = nullptr;
+
+			QString message = QString("Unable to set alternate interface setting: %1").arg(libusb_error_name(ret));
 			qDebug() << message;
 			emit statusMessage(message, 0);
 			return;
@@ -159,12 +228,42 @@ namespace Hantek6xxx {
 		if(!this->device)
 			return;
 
-		uchar value = 0x01;
-		int ret = libusb_control_transfer(this->device, LIBUSB_REQUEST_TYPE_VENDOR, TRIGGER_REG, 0x00, 0x00, &value, 1, 100);
-		if (ret < 0) {
-			qDebug("startSampling failed with error: %s", libusb_error_name(ret));
-		} else {
-			qDebug("startSampling returned %d (number of bytes transferred successfully)", ret);
+		qDebug("Start Sampling");
+		controlWrite(TRIGGER_REG, 1);
+
+		struct libusb_transfer *xfr;
+		unsigned char *data;
+		const unsigned int size = 1024;
+		int num_iso_pack = 3; //libusb_get_max_iso_packet_size(this->device, 0x82);
+
+		data = (unsigned char*) malloc(size * num_iso_pack);
+		for (int i=0; i<size * num_iso_pack; i++) data[i] = 0x0;
+
+		xfr = libusb_alloc_transfer(num_iso_pack);
+		if(!xfr){
+			QString message = QString("Unable to allocate transfer memory");
+			qDebug() << message;
+			emit statusMessage(message, 0);
+			return;
+		}
+
+		libusb_fill_iso_transfer(xfr,
+								 this->device,
+								 0x82, // Endpoint ID
+								 data,
+								 size,
+								 num_iso_pack,
+								 callbackUSBTransferComplete,
+								 NULL,
+								 100);
+		libusb_set_iso_packet_lengths(xfr, size);
+
+		if(libusb_submit_transfer(xfr) < 0)
+		{
+			// Error
+			libusb_free_transfer(xfr);
+			free(data);
+			qDebug("ERROR in submission");
 		}
 
 		DsoControl::startSampling();
@@ -175,13 +274,8 @@ namespace Hantek6xxx {
 		if(!this->device)
 			return;
 
-		uchar value = 0x00;
-		int ret = libusb_control_transfer(this->device, LIBUSB_REQUEST_TYPE_VENDOR, TRIGGER_REG, 0x00, 0x00, &value, 1, 100);
-		if (ret < 0) {
-			qDebug("stopSampling failed with error: %s", libusb_error_name(ret));
-		} else {
-			qDebug("stopSampling returned %d (number of bytes transferred successfully)", ret);
-		}
+		qDebug("Stop Sampling");
+		controlWrite(TRIGGER_REG, 0);
 
 		DsoControl::stopSampling();
 	}
@@ -196,26 +290,33 @@ namespace Hantek6xxx {
 	/// \brief Get minimum samplerate for this oscilloscope.
 	/// \return The minimum samplerate for the current configuration in S/s.
 	double Control::getMinSamplerate() {
-		return 100000; // 100Khz
+		return ::sampleRates.keys().first(); // 100Khz
 	}
 
 	/// \brief Get maximum samplerate for this oscilloscope.
 	/// \return The maximum samplerate for the current configuration in S/s.
 	double Control::getMaxSamplerate() {
-		return 48000000; // 48Mhz
+		return ::sampleRates.keys().last(); // 48Mhz
 	}
 
 	/// \brief Handles all USB things until the device gets disconnected.
 	void Control::run() {
 		// Initialize communication thread state
 
-		// GERRY !!!! this needs to happen in the init of the thread
-		libusb_handle_events(this->usbContext);
+//		// Creating a timer with zero interval will cause it to trigger on event event loop pass
+//		QTimer usbEventProcesser;
+//		usbEventProcesser.setInterval(0);
+//		usbEventProcesser.setSingleShot(false);
+//		connect(&usbEventProcesser, &QTimer::timeout, [this]() { qDebug() << "Process";
+//			libusb_handle_events(this->usbContext); // blocks up to 60 seconds, don't like, breaks signal/slot
+//		});
 
-
+		while(1) {
+			libusb_handle_events(this->usbContext);
+		}
 
 		// The control loop is running until the device is disconnected
-		exec();
+		//exec();
 
 		emit statusMessage(tr("The device has been disconnected"), 0);
 	}
@@ -402,17 +503,32 @@ namespace Hantek6xxx {
 		if(!this->device)
 			return 0.0;
 
-		// TODO convert supplied sample rate to a supported value
-
-		uchar value = 0x01;
-		int ret = libusb_control_transfer(this->device, LIBUSB_REQUEST_TYPE_VENDOR, SAMPLERATE_REG, 0x00, 0x00, &value, 1, 100);
-		if (ret < 0) {
-			qDebug("setSamplerate failed with error: %s", libusb_error_name(ret));
-		} else {
-			qDebug("setSamplerate returned %d (number of bytes transferred successfully)", ret);
+		qDebug("setSamplerate(samplerate=%lf)", samplerate);
+		// If samplerate too low, round up to the first possible option
+		auto iter = ::sampleRates.constBegin();
+		if(iter.key() >= samplerate) {
+			controlWrite(SAMPLERATE_REG, iter.value());
+			return iter.value();
 		}
 
-		return samplerate;
+		auto trailingIter = ::sampleRates.constBegin();
+		iter++;
+
+		// If in middle of the range of samples possible, round up to closest
+		while(iter != ::sampleRates.constEnd()) {
+			if(iter.key() <= samplerate && trailingIter.key() >= samplerate) {
+				controlWrite(SAMPLERATE_REG, iter.value()); // always round up
+				return iter.value();
+			}
+			iter++;
+			trailingIter++;
+		}
+
+		// Else samplerate too high so round down to the highest possible option
+		auto value = trailingIter.value();
+		controlWrite(SAMPLERATE_REG, value);
+		emit samplerateChanged(value);
+		return value;
 	}
 
 	/// \brief Sets the time duration of one aquisition by adapting the samplerate.
@@ -437,7 +553,17 @@ namespace Hantek6xxx {
 		if(channel >= HANTEK_CHANNELS)
 			return Dso::ERROR_PARAMETER;
 
-		// IMPLEMENT
+		// Only possible situations are Channel1&2, and Channel 1 alone;
+		if (channel == 2 && used && !channelsActive[1]) {
+			return Dso::ERROR_UNSUPPORTED;
+
+		qDebug("setChannelUsed(channel=%d, used=%d)", channel, (int)used);
+
+		int numChannels = channelsActive[0] + channelsActive[1];
+		controlWrite(CHANNELS_REG, numChannels);
+
+		channelsActive[channel] = used;
+
 		return Dso::ERROR_NONE;
 	}
 
@@ -452,12 +578,12 @@ namespace Hantek6xxx {
 		if(channel >= HANTEK_CHANNELS)
 			return Dso::ERROR_PARAMETER;
 
-	//	if (this->device->getModel() == MODEL_DSO6022BE)
-	//		Dso::ERROR_NONE;
+		return Dso::ERROR_UNSUPPORTED;
 
-		// IMPLEMENT
+		qDebug("setCoupling(channel=%d, coupling=%d", channel, (int)coupling);
+		//uint8_t coupling = 0xFF & ((devc->coupling[1] << 4) | devc->coupling[0]);
 
-		return Dso::ERROR_NONE;
+		return controlWrite(COUPLING_REG, coupling); // may not work
 	}
 
 	/// \brief Sets the gain for the given channel.
@@ -471,8 +597,14 @@ namespace Hantek6xxx {
 		if(channel >= HANTEK_CHANNELS)
 			return Dso::ERROR_PARAMETER;
 
-		// IMPLEMENT
-		return 1.0;
+		auto reg = (channel == 0) ? VDIV_CH1_REG : VDIV_CH2_REG;
+
+		// Apparently the chipset can deal any integer gain values
+		unsigned int value = (unsigned int) gain;
+
+		controlWrite(reg, value);
+
+		return value;
 	}
 
 	/// \brief Set the offset for the given channel.
@@ -585,5 +717,49 @@ namespace Hantek6xxx {
 		return Dso::ERROR_UNSUPPORTED;
 	}
 #endif
+
+	/// \brief Sends control commands.
+	/// \param request The request command
+	/// \param value   The requested value
+	/// \return Number of bytes sent
+	int Control::controlWrite(Control::ControlRequests request, unsigned char value)
+	{
+		int ret = libusb_control_transfer(this->device, LIBUSB_REQUEST_TYPE_VENDOR, request, 0x00, 0x00, &value, 1, 100);
+		if (ret < 0) {
+			qDebug("controlWrite failed with error: %s", libusb_error_name(ret));
+		}
+		return ret;
+	}
+
+	/// \brief Convenience function for analog voltages into the ADC count the scope would see.
+	/// \param float voltage: The analog voltage to convert.
+	/// \param int voltage_range: The voltage range current set for the channel.
+	/// \param int probe_multiplier: (OPTIONAL) An additonal multiplictive factor for changing the probe impedance.
+	///                              Default: 1
+	/// \return: The corresponding ADC count.
+	double voltage_to_adc(double voltage, int voltage_range, double probe_multiplier=1) {
+		return voltage*(voltage_range << 7)/(5.0 * probe_multiplier) + 128;
+	}
+
+	/// Convenience function for converting an ADC count from the scope to a nicely scaled voltage.
+	/// \param int adc_count: The scope ADC count.
+	/// \param int voltage_range: The voltage range current set for the channel.
+	/// \param int probe_multiplier: (OPTIONAL) An additonal multiplictive factor for changing the probe impedance.
+	///                              Default: 1
+	/// \return: The analog voltage corresponding to that ADC count.
+	double adc_to_voltage(double adc_count, int voltage_range, double probe_multiplier=1) {
+		return (adc_count - 128)*(5.0 * probe_multiplier)/(voltage_range << 7);
+	}
+
+	/// Convenience method for converting a sampling rate index into a list of times from beginning of data collection
+	/// and getting human-readable sampling rate string.
+	/// \param num_points: The number of data points.
+	///	\param rate_index: The sampling rate index used for data collection.
+	/// \return: A list of times in seconds from beginning of data collection, and the nice human readable rate label.
+
+	void convert_sampling_rate_to_measurement_times(int num_points, unsigned char rate_index) {
+		//rate_label, rate = self.SAMPLE_RATES.get(rate_index, ("? MS/s", 1.0));
+		//return [i/rate for i in range(num_points)], rate_label;
+	}
 
 } // namespace Hantek6xxx

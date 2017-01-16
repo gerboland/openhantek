@@ -54,6 +54,15 @@ namespace Hantek6xxx {
 			double getMinSamplerate() override;
 			double getMaxSamplerate() override;
 
+			enum ControlRequests {
+				VDIV_CH1_REG   = 0xe0,
+				VDIV_CH2_REG   = 0xe1,
+				SAMPLERATE_REG = 0xe2,
+				TRIGGER_REG    = 0xe3,
+				CHANNELS_REG   = 0xe4,
+				COUPLING_REG   = 0xe5,
+			};
+
 		protected:
 			void run() override;
 
@@ -88,10 +97,13 @@ namespace Hantek6xxx {
 			int stringCommand(QString command) override;
 	#endif
 		private:
+			int controlWrite(ControlRequests request, unsigned char value);
+
 			libusb_context *usbContext;
 			libusb_device_handle *device;
 
 			QList<unsigned int> availableRecordLengths;
+			bool channelsActive[2];
 	};
 
 } // namespace Hantek6xxx
